@@ -1,18 +1,21 @@
-using Microsoft.AspNetCore.DataProtection.KeyManagement;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.AspNetCore.Routing;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
+using System.Net.Http;
 using System.Text;
 using System.Text.Json;
+using TranslationsAPI.Models;
+using static TranslationsAPI.Models.TranslationRequest;
 
 namespace TranslationsAPI
 {
     public class DocumentsTranslation
     {
         private readonly ILogger<DocumentsTranslation> _logger;
+        private readonly IHttpClientFactory _httpClientFactory;
+
         private static readonly string _endpoint = "https://translation-123455.cognitiveservices.azure.com/";
         private static readonly string _location = "eastus";
         private static readonly string _apiVersion = "2024-05-01";
@@ -22,9 +25,10 @@ namespace TranslationsAPI
         private static readonly string _sourceUrl = "";
         private static readonly string _targetUrl = "";
 
-        public DocumentsTranslation(ILogger<DocumentsTranslation> logger)
+        public DocumentsTranslation(ILogger<DocumentsTranslation> logger, IHttpClientFactory httpClientFactory)
         {
             _logger = logger;
+            _httpClientFactory = httpClientFactory;
         }
 
         [Function("TranslateDocs")]
@@ -59,114 +63,74 @@ namespace TranslationsAPI
                 }
             };
 
-            using (HttpClient client = new HttpClient())
-            using (HttpRequestMessage request = new HttpRequestMessage())
+            var client = _httpClientFactory.CreateClient();
+            client.DefaultRequestHeaders.Add("Ocp-Apim-Subscription-Key", _key);
+            client.DefaultRequestHeaders.Add("Ocp-Apim-Subscription-Region", _location);
+
+            var options = new JsonSerializerOptions
             {
-                request.Method = HttpMethod.Post;
-                request.RequestUri = new Uri(_endpoint + _batchTranslateSuffix + "?api-version=" + _apiVersion);
-                request.Headers.Add("Ocp-Apim-Subscription-Key", _key);
-                request.Headers.Add("Ocp-Apim-Subscription-Region", _location);
+                PropertyNameCaseInsensitive = true,
+                DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+            };
+            var json = JsonSerializer.Serialize(translationRequest, options);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+            var response = await client.PostAsync(_endpoint + _batchTranslateSuffix + "?api-version=" + _apiVersion, content);
 
-                var options = new JsonSerializerOptions
+            if (response.IsSuccessStatusCode)
+            {
+                var responseContent = await response.Content.ReadAsStringAsync();
+                var translationJob = JsonSerializer.Deserialize<TranslationResponse>(responseContent, options);
+
+                if (response.Headers.TryGetValues("Operation-Location", out var operationLocationValues))
                 {
-                    DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
-                };
-                var json = JsonSerializer.Serialize(translationRequest, options);
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-                request.Content = content;
+                    translationJob.Location = operationLocationValues.FirstOrDefault()!;
+                }
 
-                var res = await client.SendAsync(request);
-                return new OkObjectResult("Operation completed successfully");
+                //{
+                //    "id": "ed6bef5a-b05f-4e28-b950-4a6642f1bb1e",
+                //    "status": "NotStarted",
+                //    "location": "https://translation-123455.cognitiveservices.azure.com/translator/document/batches/ed6bef5a-b05f-4e28-b950-4a6642f1bb1e?api-version=2024-05-01"
+                //}
+
+                return new OkObjectResult(translationJob);
             }
-
+            else
+            {
+                _logger.LogError($"Request failed with status code: {response.StatusCode}");
+                return new BadRequestObjectResult($"Request failed with status code: {response.StatusCode}");
+            }
         }
 
         [Function("GetJobStatus")]
         public async Task<IActionResult> Run2(
-            [HttpTrigger(AuthorizationLevel.Function, "get", Route = "jobs/{jobId}/status")] HttpRequest req,
+            [HttpTrigger(AuthorizationLevel.Function, "get", Route = "jobs/{jobId}")] HttpRequest req,
             string jobId)
         {
             _logger.LogInformation("C# HTTP trigger function processed a request.");
 
-            using (HttpClient client = new HttpClient())
-            using (HttpRequestMessage request = new HttpRequestMessage())
+            var client = _httpClientFactory.CreateClient();
+            client.DefaultRequestHeaders.Add("Ocp-Apim-Subscription-Key", _key);
+            client.DefaultRequestHeaders.Add("Ocp-Apim-Subscription-Region", _location);
+
+            var options = new JsonSerializerOptions
             {
-                request.Method = HttpMethod.Get;
-                request.RequestUri = new Uri(_endpoint + _translationStatusSuffix + $"/{jobId}" + "?api-version=" + _apiVersion);
-                request.Headers.Add("Ocp-Apim-Subscription-Key", _key);
+                PropertyNameCaseInsensitive = true,
+                DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+            };
+            var response = await client.GetAsync(_endpoint + _batchTranslateSuffix + "/" + jobId + "?api-version=" + _apiVersion);
 
-                HttpResponseMessage response = await client.SendAsync(request);
-                string result = await response.Content.ReadAsStringAsync();
+            if (response.IsSuccessStatusCode)
+            {
+                var responseContent = await response.Content.ReadAsStringAsync();
+                var translationJob = JsonSerializer.Deserialize<TranslationJob>(responseContent, options);
 
-                _logger.LogInformation($"Status code: {response.StatusCode}");
-                _logger.LogInformation($"Response Headers: {response.Headers}");
-                _logger.LogInformation(result);
-
-                return new OkObjectResult(result);
+                return new OkObjectResult(translationJob);
+            }
+            else
+            {
+                _logger.LogError($"Request failed with status code: {response.StatusCode}");
+                return new BadRequestObjectResult($"Request failed with status code: {response.StatusCode}");
             }
         }
-    }
-
-    public class TranslationRequest
-    {
-        public List<Input> Inputs { get; set; }
-    }
-
-    public class Input
-    {
-        public Source Source { get; set; }
-        public List<Target> Targets { get; set; }
-        public string StorageType { get; set; }
-    }
-
-    public class Source
-    {
-        public string SourceUrl { get; set; }
-        public Filter Filter { get; set; }
-        public string Language { get; set; }
-        public string StorageSource { get; set; }
-    }
-
-    public class Filter
-    {
-        public string Prefix { get; set; }
-        public string Suffix { get; set; }
-    }
-
-    public class Target
-    {
-        public string TargetUrl { get; set; }
-        public string Category { get; set; }
-        public string Language { get; set; }
-        public List<Glossary> Glossaries { get; set; }
-        public string StorageSource { get; set; }
-    }
-
-    public class Glossary
-    {
-        public string GlossaryUrl { get; set; }
-        public string Format { get; set; }
-        public string Version { get; set; }
-        public string StorageSource { get; set; }
-    }
-
-    public class TranslationJob
-    {
-        public Guid Id { get; set; }
-        public DateTime CreatedDateTimeUtc { get; set; }
-        public DateTime LastActionDateTimeUtc { get; set; }
-        public string Status { get; set; }
-        public Summary Summary { get; set; }
-    }
-
-    public class Summary
-    {
-        public int Total { get; set; }
-        public int Failed { get; set; }
-        public int Success { get; set; }
-        public int InProgress { get; set; }
-        public int NotYetStarted { get; set; }
-        public int Cancelled { get; set; }
-        public int TotalCharacterCharged { get; set; }
     }
 }
